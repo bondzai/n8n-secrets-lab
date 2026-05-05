@@ -1,0 +1,113 @@
+# Infisical (self-hosted) + n8n + Postgres.
+# Two Postgres instances kept separate so each service owns its own DB:
+#   - infisical-db  : Infisical's metadata store
+#   - n8n-db        : n8n's workflow / credential store
+#
+# Flow at boot:
+#   1. Infisical comes up, you log in, create a project, add secret
+#      DEMO_API_KEY = sk_demo_SUPER_SECRET_12345 and N8N_ENCRYPTION_KEY=<hex>.
+#   2. Create a Machine Identity (Universal Auth) → get CLIENT_ID / CLIENT_SECRET.
+#   3. Put those two IDs in `.env` (these are the ONLY local secrets).
+#   4. The `infisical-agent` sidecar logs in, fetches the secrets, writes them
+#      to a shared tmpfs volume as a dotenv file.
+#   5. n8n starts after the agent, loads the file via `env_file:`-style sourcing.
+
+services:
+  infisical-db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: infisical
+      POSTGRES_PASSWORD: infisical
+      POSTGRES_DB: infisical
+    volumes:
+      - infisical_pg:/var/lib/postgresql/data
+
+  infisical-redis:
+    image: redis:7-alpine
+
+  infisical:
+    image: infisical/infisical:latest
+    depends_on: [infisical-db, infisical-redis]
+    ports: ["8080:8080"]
+    environment:
+      ENCRYPTION_KEY: "6c1fe4e407b8911c104518103505b218"   # demo only
+      AUTH_SECRET: "5lrMXKKWCVocS/uerPsl7V+TX/aaUaI7iDArF20GtoA="  # demo only
+      DB_CONNECTION_URI: postgres://infisical:infisical@infisical-db:5432/infisical
+      REDIS_URL: redis://infisical-redis:6379
+      SITE_URL: http://localhost:8080
+
+  # ---- n8n side ----
+  n8n-db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: n8n
+      POSTGRES_PASSWORD: n8n
+      POSTGRES_DB: n8n
+    volumes:
+      - n8n_pg:/var/lib/postgresql/data
+
+  # Sidecar: pulls secrets from Infisical → writes to /shared/secrets.env
+  infisical-agent:
+    image: infisical/cli:latest
+    depends_on: [infisical]
+    environment:
+      INFISICAL_API_URL: http://infisical:8080/api
+      CLIENT_ID: ${INFISICAL_CLIENT_ID}
+      CLIENT_SECRET: ${INFISICAL_CLIENT_SECRET}
+      PROJECT_ID: ${INFISICAL_PROJECT_ID}
+      ENV_SLUG: dev
+    volumes:
+      - shared-secrets:/shared
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        set -e
+        infisical login --method=universal-auth \
+          --client-id="$$CLIENT_ID" --client-secret="$$CLIENT_SECRET" \
+          --domain="$$INFISICAL_API_URL" --plain --silent > /tmp/token
+        export INFISICAL_TOKEN=$$(cat /tmp/token)
+        infisical export --projectId "$$PROJECT_ID" --env "$$ENV_SLUG" \
+          --format dotenv > /shared/secrets.env
+        chmod 600 /shared/secrets.env
+        # keep container alive so dependents can start; re-fetch every 5 min
+        while true; do
+          sleep 300
+          infisical export --projectId "$$PROJECT_ID" --env "$$ENV_SLUG" \
+            --format dotenv > /shared/secrets.env
+        done
+
+  n8n:
+    image: n8nio/n8n:latest
+    depends_on:
+      infisical-agent:
+        condition: service_started
+      n8n-db:
+        condition: service_started
+    ports: ["5678:5678"]
+    environment:
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: n8n-db
+      DB_POSTGRESDB_DATABASE: n8n
+      DB_POSTGRESDB_USER: n8n
+      DB_POSTGRESDB_PASSWORD: n8n
+      N8N_SECURE_COOKIE: "false"
+      N8N_DIAGNOSTICS_ENABLED: "false"
+      N8N_HIRING_BANNER_ENABLED: "false"
+      N8N_PERSONALIZATION_ENABLED: "false"
+    volumes:
+      - shared-secrets:/run/secrets-shared:ro
+      - n8n_data:/home/node/.n8n
+    # Source the fetched secrets file before launching n8n.
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        set -a
+        . /run/secrets-shared/secrets.env
+        set +a
+        exec n8n
+
+volumes:
+  infisical_pg:
+  n8n_pg:
+  n8n_data:
+  shared-secrets:
